@@ -795,3 +795,37 @@ def check_archived_reuse(draft_id: int) -> dict:
             "items": items,
             "reusable": reusable,
         }
+
+
+# ---------------- 工艺单导出（只读归档冻结快照） ----------------
+
+
+def get_archived_document(draft_id: int) -> dict:
+    """读取已归档炉次的冻结快照，供导出单文件 HTML 工艺单。
+
+    - 炉次不存在 => NotFound（404）；
+    - 炉次存在但未归档（活动草稿 / 无解草稿）=> Unprocessable（422）；
+    - 已归档 => 返回炉次名称 / ID / 冻结版本 / 归档时间、按原引用顺序的
+      配方 ID 与冻结配方版本、冻结材料参数快照与冻结完整求解结果。
+      全部取自归档冻结快照（归档后 drafts 行不再被重算改写），不读取
+      当前配方、不重新求解；纯只读，绝无任何写入。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(_DRAFT_SELECT + " WHERE d.id=?", (draft_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        if row["archive_id"] is None:
+            raise Unprocessable(
+                "该炉次尚未归档，工艺单只能针对已归档的冻结方案导出。"
+            )
+        d = _draft_dict(row)
+        return {
+            "id": d["id"],
+            "name": d["name"],
+            "version": d["version"],
+            "archivedAt": d["archivedAt"],
+            "recipeIds": d["recipeIds"],
+            "recipeVersions": d["recipeVersions"],
+            "materials": d["materials"],
+            "result": d["result"],
+        }

@@ -7,15 +7,16 @@ import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import electricity, store
+from . import document, electricity, store
 from .db import init_db
 from .solver import Material, solve
 from .solver import validate_material as solver_validate_material
@@ -29,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="共炉保温编排台", version="2.3.0", lifespan=lifespan)
+app = FastAPI(title="共炉保温编排台", version="2.4.0", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -459,6 +460,33 @@ def draft_reuse_check(draft_id: int):
         return store.check_archived_reuse(draft_id)
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 已归档炉次工艺单导出（只读，不写数据库） ----------------
+
+
+@app.get("/api/drafts/{draft_id}/document")
+def draft_document(draft_id: int):
+    # 单文件 HTML 工艺单：未知炉次 404，未归档 422；内容全部取自归档冻结
+    # 快照，不读当前配方、不重新求解、不写任何数据
+    try:
+        doc = store.get_archived_document(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+    html_text = document.render_document(doc)
+    # 附件文件名含炉次 ID 与冻结版本；中文名走 RFC 5987，另附 ASCII 回退名
+    filename = f"炉次-{draft_id}-v{doc['version']}-工艺单.html"
+    fallback = f"draft-{draft_id}-v{doc['version']}-process-sheet.html"
+    return HTMLResponse(
+        content=html_text,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{fallback}\"; "
+                f"filename*=UTF-8''{quote(filename)}"
+            )
+        },
+    )
 
 
 @app.get("/healthz")
