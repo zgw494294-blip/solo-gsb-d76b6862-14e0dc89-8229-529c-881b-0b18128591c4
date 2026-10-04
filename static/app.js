@@ -831,6 +831,11 @@ let archivingIds = new Set(); // 已提交、尚未返回的归档请求所绑�
 const draftDetailError = document.getElementById("draft-detail-error");
 const draftDetailOk = document.getElementById("draft-detail-ok");
 const draftArchiveBtn = document.getElementById("draft-archive-btn");
+const draftSheetBtn = document.getElementById("draft-sheet-btn");
+const draftSheetError = document.getElementById("draft-sheet-error");
+const draftSheetOk = document.getElementById("draft-sheet-ok");
+// 已提交、尚未返回的工艺单下载请求所绑定的炉次 ID（同炉次去重，不同炉次独立）
+let downloadingIds = new Set();
 
 // 详情仍在加载（当前选择的最新 GET 未成功读回）期间，归档不可用
 function detailLoading() {
@@ -838,6 +843,9 @@ function detailLoading() {
 }
 
 function syncArchiveButton() {
+  // 工艺单按钮先无条件同步：加载中 / 无有效详情 / 活动草稿等分支随后
+  // 提前 return，也必须保证下载按钮被隐藏。
+  syncSheetButton();
   if (detailLoading()) {
     draftArchiveBtn.disabled = true;
     draftArchiveBtn.textContent = "详情加载中…";
@@ -857,6 +865,33 @@ function syncArchiveButton() {
   draftArchiveBtn.textContent = viewedDraft.status === "archived"
     ? "已归档（方案已冻结）"
     : `核准归档（携带版本 v${viewedDraft.version}）`;
+}
+
+// 工艺单下载按钮只在「当前已归档详情成功加载后」出现：加载中、读取失败
+// （含网络异常）或活动草稿一律隐藏；同一炉次的下载在自身响应回来前禁用
+// 并去重，切到别的炉次不影响其在途请求。
+function syncSheetButton() {
+  if (viewedDraft && viewedDraft.status === "archived" && !getInFlight) {
+    draftSheetBtn.hidden = false;
+    if (downloadingIds.has(viewedDraft.id)) {
+      draftSheetBtn.disabled = true;
+      draftSheetBtn.textContent = "工艺单下载中…";
+    } else {
+      draftSheetBtn.disabled = false;
+      draftSheetBtn.textContent = `下载 HTML 工艺单（#${viewedDraft.id} · v${viewedDraft.version}）`;
+    }
+  } else {
+    draftSheetBtn.hidden = true;
+    draftSheetBtn.disabled = false;
+    draftSheetBtn.textContent = "下载 HTML 工艺单";
+  }
+}
+
+function clearSheetMessages() {
+  draftSheetError.hidden = true;
+  draftSheetError.textContent = "";
+  draftSheetOk.hidden = true;
+  draftSheetOk.textContent = "";
 }
 
 async function loadRecipesIntoRefs() {
@@ -995,6 +1030,8 @@ async function openDraft(id, banner) {
   titleEl.textContent = `炉次 #${id} 详情加载中…`;
   draftMeta.innerHTML = "";
   draftResultView.clear();
+  // 一切换 / 刷新即作废旧下载提示；旧下载的迟到回包按代际丢弃，不写提示
+  clearSheetMessages();
   if (banner && banner.kind === "error") {
     draftDetailError.textContent = banner.text;
     draftDetailError.hidden = false;
@@ -1017,7 +1054,7 @@ async function openDraft(id, banner) {
       draftDetailError.textContent = detailOf(data);
       draftDetailError.hidden = false;
       draftDetailOk.hidden = true;
-      syncArchiveButton();
+      syncArchiveButton(); // 同时隐藏工艺单下载按钮（已归档详情并未成功加载）
       return;
     }
     renderDraftDetail(data, banner);
@@ -1183,6 +1220,121 @@ draftArchiveBtn.addEventListener("click", async () => {
     kind: "ok",
     text: `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`,
   });
+});
+
+// ============================================================
+// 已归档炉次工艺单下载（只读归档快照，不写库；
+// 绑定点击时炉次，切换 / 刷新后旧响应与异常一律不下载、不写提示）
+// ============================================================
+
+// 从 Content-Disposition 解析文件名：优先 RFC 5987 的 filename*=UTF-8''，
+// 其次 ASCII filename；都没有时用兜底名。
+function parseFilename(header, fallback) {
+  if (header) {
+    const star = /filename\*\s*=\s*([^']+)'([^']*)'([^;]+)/i.exec(header);
+    if (star) {
+      try { return decodeURIComponent(star[3].trim()); } catch (e) { /* 继续 */ }
+    }
+    const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(header);
+    if (plain && plain[1]) return plain[1].trim();
+  }
+  return fallback;
+}
+
+async function triggerBrowserDownload(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    // 浏览器已接管下载后即可释放
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+  }
+}
+
+draftSheetBtn.addEventListener("click", async () => {
+  // 仅当前已归档详情成功加载后可点（按钮在其他状态下隐藏）
+  if (!viewedDraft || viewedDraft.status !== "archived" || getInFlight) return;
+  // 绑定点击那一刻的炉次 ID 与详情代际
+  const targetId = viewedDraft.id;
+  const clickSeq = detailSeq;
+  // 同一炉次下载请求未结束前不得重复提交（不同炉次互不影响）
+  if (downloadingIds.has(targetId)) return;
+
+  clearSheetMessages();
+  downloadingIds.add(targetId);
+  syncSheetButton();
+
+  let resp;
+  try {
+    // 工艺单是 HTML 附件，不能带 api() 的 JSON 请求头；直接用 fetch 取 blob
+    resp = await fetch(`/api/drafts/${targetId}/sheet`);
+  } catch (e) {
+    downloadingIds.delete(targetId);
+    // 切走 / 刷新后到达的网络异常：不下载、不写提示，仅恢复按钮资格
+    if (clickSeq !== detailSeq) { syncSheetButton(); return; }
+    draftSheetError.textContent = "工艺单下载失败（网络异常），未改变任何数据，可重试。";
+    draftSheetError.hidden = false;
+    syncSheetButton();
+    return;
+  }
+
+  if (!resp.ok) {
+    // 404/422/500 等 HTTP 错误：读回中文原因展示，不触发任何下载
+    let reason = "工艺单下载失败，请重试。";
+    try {
+      const data = await resp.json();
+      reason = detailOf(data);
+    } catch (e) { /* 响应体不是 JSON：用兜底原因 */ }
+    downloadingIds.delete(targetId);
+    if (clickSeq !== detailSeq) { syncSheetButton(); return; }
+    draftSheetError.textContent = `工艺单下载失败：${reason}`;
+    draftSheetError.hidden = false;
+    syncSheetButton();
+    return;
+  }
+
+  let blob;
+  try {
+    blob = await resp.blob();
+  } catch (e) {
+    downloadingIds.delete(targetId);
+    if (clickSeq !== detailSeq) { syncSheetButton(); return; }
+    draftSheetError.textContent = "工艺单内容读取失败（网络异常），可重试。";
+    draftSheetError.hidden = false;
+    syncSheetButton();
+    return;
+  }
+  downloadingIds.delete(targetId);
+
+  // 切换或刷新后才完整到达的旧响应：既不触发下载，也不写任何提示；
+  // 但要按当前有效详情恢复按钮（旧在途去重状态至此释放）。
+  if (clickSeq !== detailSeq) { syncSheetButton(); return; }
+
+  // 服务端返回的是 UTF-8 HTML 附件；文件名含炉次 ID 与冻结版本
+  const filename = parseFilename(
+    resp.headers.get("Content-Disposition"),
+    `draft-${targetId}-sheet.html`
+  );
+  try {
+    await triggerBrowserDownload(
+      new Blob([blob], { type: "text/html;charset=utf-8" }),
+      filename
+    );
+  } catch (e) {
+    draftSheetError.textContent = "工艺单已生成，但浏览器保存失败，可重试。";
+    draftSheetError.hidden = false;
+    syncSheetButton();
+    return;
+  }
+  draftSheetOk.textContent =
+    `工艺单已下载：${filename}。文件内容取自归档冻结快照，可离线打开，后续配方修改、停用及重启均不改变。`;
+  draftSheetOk.hidden = false;
+  syncSheetButton();
 });
 
 // ============================================================

@@ -7,15 +7,16 @@ import math
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import electricity, store
+from . import electricity, exports, store
 from .db import init_db
 from .solver import Material, solve
 from .solver import validate_material as solver_validate_material
@@ -459,6 +460,33 @@ def draft_reuse_check(draft_id: int):
         return store.check_archived_reuse(draft_id)
     except store.StoreError as exc:
         _raise_store_error(exc)
+
+
+# ---------------- 已归档炉次工艺单导出（只读归档快照，不写库） ----------------
+
+
+@app.get("/api/drafts/{draft_id}/sheet", response_class=HTMLResponse)
+def draft_sheet(draft_id: int):
+    # 只读导出：未知炉次 404，未归档 422。全部数据取归档快照，不读当前
+    # 配方、不重新求解，也不写数据库；文档为样式内嵌、无外部资源/脚本的
+    # 单份 UTF-8 HTML，作为附件下载，文件名含炉次 ID 与冻结版本。
+    try:
+        snapshot = store.get_archived_sheet(draft_id)
+    except store.StoreError as exc:
+        _raise_store_error(exc)
+
+    html_text = exports.render_sheet(snapshot)
+    ascii_name = f"draft-{snapshot['draft']['id']}-v{snapshot['version']}-sheet.html"
+    utf8_name = f"炉次{snapshot['draft']['id']}-v{snapshot['version']}-工艺单.html"
+    return HTMLResponse(
+        content=html_text,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{quote(utf8_name)}"
+            )
+        },
+    )
 
 
 @app.get("/healthz")

@@ -733,6 +733,39 @@ def get_archived_curve(draft_id: int) -> dict:
         }
 
 
+# ---------------- 工艺单导出（只读归档快照，不写库） ----------------
+
+
+def get_archived_sheet(draft_id: int) -> dict:
+    """读取已归档炉次的**归档快照**用于导出离线 HTML 工艺单。
+
+    - 炉次不存在 => NotFound（404）；
+    - 炉次存在但未归档（活动草稿 / 无解草稿）=> Unprocessable（422）；
+    - 已归档 => 返回炉次名称 / ID / 冻结版本 / 归档时间，以及按原引用
+      顺序排列的冻结配方版本与冻结材料参数、冻结完整求解结果。
+
+    纯只读：只取 archives 与 drafts 的冻结列，不读当前配方、不重新求解，
+    绝不写入任何数据；后续配方修改、停用及重启都不改变返回内容。
+    """
+    with lock(), connect() as conn:
+        row = conn.execute(_DRAFT_SELECT + " WHERE d.id=?", (draft_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"炉次草稿 {draft_id} 不存在。")
+        if row["archive_id"] is None:
+            raise Unprocessable(
+                "该炉次尚未归档，工艺单只能导出已归档炉次的冻结快照。"
+            )
+        return {
+            "draft": {"id": row["id"], "name": row["name"]},
+            "recipeIds": json.loads(row["recipe_ids"]),
+            "recipeVersions": json.loads(row["recipe_versions_json"]),
+            "materials": json.loads(row["archived_materials_json"]),
+            "result": json.loads(row["archived_result_json"]),
+            "version": row["archived_draft_version"],
+            "archivedAt": row["archived_at"],
+        }
+
+
 # ---------------- 原曲线复用检查（只读，不重新求解） ----------------
 
 

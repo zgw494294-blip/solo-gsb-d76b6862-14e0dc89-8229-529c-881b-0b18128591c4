@@ -11,10 +11,10 @@
 - 后端：Python + FastAPI（求解核心见 `app/solver.py`，纯标准库 BFS；
   配方 / 炉次 / 归档用 SQLite 持久化，见 `app/db.py`、`app/store.py`；
   已归档炉次只读电费试算见 `app/electricity.py`，原曲线复用只读核验见
-  `app/reuse.py`）
+  `app/reuse.py`，归档快照离线 HTML 工艺单导出见 `app/exports.py`）
 - 前端：原生 HTML / CSS / JavaScript（`static/`，无任何前端构建与框架，
   页面分为「编排求解 / 材料配方 / 炉次草稿」三个标签页；已归档炉次详情中
-  含原曲线复用检查与电费试算卡片）
+  含原曲线复用检查、电费试算卡片与单份 HTML 工艺单下载）
 
 ## 一条命令启动
 
@@ -269,6 +269,7 @@ SQLite（默认 `/data/planner.db`），Compose 以命名卷 `planner-data` 挂�
 | POST | `/api/drafts/{id}/archive` | 携带查看版本归档（过期 409 / 无解 422） |
 | POST | `/api/drafts/{id}/reuse-check` | 已归档炉次原曲线复用检查（只读当前配方，不重新求解；未知 404 / 未归档 422） |
 | POST | `/api/drafts/{id}/electricity` | 已归档炉次电费试算（只读冻结曲线，不保存；未知 404 / 未归档或参数非法 422） |
+| GET | `/api/drafts/{id}/sheet` | 下载已归档炉次的单份离线 HTML 工艺单（UTF-8 HTML 附件；未知 404 / 未归档 422；只读归档快照，不写库） |
 
 ### 从零编排（可直接复制执行）
 
@@ -710,18 +711,83 @@ curl -sS -X POST http://localhost:8000/api/drafts/1/reuse-check
 代际，旧响应（成功 / HTTP 错误 / 网络异常）一律作废，不会回填到当前界面，
 等待期间按钮禁用、不重复提交。
 
+### 下载已归档炉次工艺单 `GET /api/drafts/{id}/sheet`
+
+把**已归档**炉次导出为可脱离服务打开的**单份 HTML 工艺单**：响应为
+`Content-Type: text/html; charset=utf-8` 的 **UTF-8 HTML 附件**
+（`Content-Disposition: attachment`），文件名含炉次 ID 与冻结版本，例如
+`draft-1-v3-sheet.html`（`filename*` 同时给出中文名
+`炉次1-v3-工艺单.html`）。
+
+状态码：
+
+- 炉次 ID 未知 → **404**（返回 JSON 中文原因，与其他炉次接口一致）；
+- 炉次存在但**未归档**（活动草稿，含当前无解）→ **422**；
+- 已归档 → **200**，返回 HTML 附件。
+
+导出**只读归档快照，不写数据库**：全部数据取自归档时冻结的炉次名称、ID、
+冻结版本、归档时间、按原引用顺序排列的配方 ID 与冻结配方版本、冻结材料
+名称 / 保温上下限 / 时长 / 耐受上限、冻结求解结果中的首次达标区间（含起止
+档）、总时长与按档号排列的温度表；**不读取当前配方、不重新求解**，后续的
+配方修改、配方停用及服务重启都不会改变文档内容。文档内档号从 1 起，第 k
+档标注 `[(k−1)×5, k×5)` 分钟。样式全部内嵌在 `<style>` 中，不依赖网络、
+外部资源或脚本；炉次 / 材料等文本一律按原字符展示（HTML 转义），不能被
+当作 HTML 执行。下载后的 `.html` 文件可直接双击离线打开，也适合打印归档。
+
+可直接复制执行（炉次 1 已归档、冻结版本为 v1）：
+
+```bash
+# -O 按服务端文件名保存：draft-1-v1-sheet.html
+curl -sS -OJ http://localhost:8000/api/drafts/1/sheet
+# 也可用 -o 自行指定文件名
+curl -sS http://localhost:8000/api/drafts/1/sheet -o 炉次1-工艺单.html
+
+# 未知炉次 → 404
+curl -sS -i http://localhost:8000/api/drafts/999/sheet
+# HTTP/1.1 404 Not Found
+# {"detail":"炉次草稿 999 不存在。"}
+
+# 存在但未归档 → 422
+curl -sS -i http://localhost:8000/api/drafts/2/sheet
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":"该炉次尚未归档，工艺单只能导出已归档炉次的冻结快照。"}
+```
+
+响应头示例：
+
+```http
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+content-disposition: attachment; filename="draft-1-v1-sheet.html";
+  filename*=UTF-8''%E7%82%89%E6%AC%A11-v1-%E5%B7%A5%E8%89%BA%E5%8D%95.html
+```
+
+前端仅在「炉次草稿」详情区，于**当前已归档详情成功加载之后**显示
+「下载 HTML 工艺单」按钮；详情加载中、读取失败（含网络异常）或炉次未归档
+时按钮隐藏。下载请求的请求编排与归档、试算、复用检查同一口径：
+
+- **绑定点击那一刻的炉次 ID**：提交后立刻切到别的炉次，旧下载照常完成但
+  **不触发保存、不写提示**；按钮始终只反映当前炉次。
+- **切换炉次或刷新详情即作废旧下载**：旧响应（成功 / 404 / 422 / 500）或
+  网络异常一律作废，既不会触发浏览器下载，也不会在新界面写入成功 / 失败
+  提示；同一炉次的下载在自身响应回来前按钮禁用并按炉次 ID 去重，不同炉次
+  的下载互不影响。
+- **失败显示后端中文原因（如未归档 422）或网络异常提示，按钮立即可重试**；
+  导出为只读操作，失败与重试都不改变任何数据。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 复用检查 / 电费试算）
+│   ├── main.py        # FastAPI 路由与参数校验（schedule / recipes / drafts / archive / 复用检查 / 电费试算 / 工艺单下载）
 │   ├── solver.py      # 规则常量、校验与 BFS 求解（配方与草稿复用）
 │   ├── reuse.py       # 已归档炉次原曲线复用检查（只读核验，不重新求解）
 │   ├── electricity.py # 已归档炉次电费试算（跨小时/午夜分摊、逐档与总费用舍入）
+│   ├── exports.py     # 已归档炉次单份离线 HTML 工艺单渲染（纯归档快照，样式内嵌）
 │   ├── db.py          # SQLite 连接、建表、全局读锁与写操作互斥锁
-│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 的事务化读写
+│   └── store.py       # 配方 / 炉次草稿 / 归档 / 归档曲线只读 / 复用检查 / 工艺单快照 的事务化读写
 ├── static/
 │   ├── index.html     # 页面（编排求解 / 材料配方 / 炉次草稿 三个标签页）
 │   ├── styles.css     # 样式
